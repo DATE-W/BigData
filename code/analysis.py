@@ -1,13 +1,25 @@
 import pandas as pd
-import numpy as np
+from sklearn.metrics import silhouette_score, accuracy_score
+from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from sklearn.tree import DecisionTreeClassifier
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+import logging
+import os
+import gc
+
+# 指定临时目录到 D 盘，避免C盘空间不足
+os.environ['TMP'] = 'D:\\temp'
+os.environ['TEMP'] = 'D:\\temp'
+
+# 设置日志以实时监控代码执行
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
 # 1. 读取数据
-data = pd.read_csv('cleaned_data.csv', sep='\t', header=0,
+data = pd.read_csv('data.txt', sep='\t', header=None,
                    dtype={'calling_nbr': str,
                           'called_nbr': str,
                           'calling_city': str,
@@ -16,90 +28,152 @@ data = pd.read_csv('cleaned_data.csv', sep='\t', header=0,
                           'called_roam_city': str,
                           'calling_cell': str})
 
-# 2. 数据预处理：特征提取
-# 用户是否为主叫（主叫 = 1， 被叫 = 0）
-data['is_caller'] = np.where(data['calling_nbr'] == data['called_nbr'], 0, 1)
+# 2. 数据预处理与特征工程
 
-# 将通话开始时间转换为小时（时间段）
-data['start_hour'] = pd.to_datetime(data['start_time'].astype(str), format='%H:%M:%S').dt.hour
-data['time_slot'] = data['start_hour'] // 3 + 1  # 将时间划分为8个时间段（0-3, 3-6, ..., 21-24）
+logger.info("开始数据预处理与特征工程...")
 
-# 计算通话时长
-data['call_duration'] = data['raw_dur']
+# 2.1 将通话开始时间转换为小时
+logger.info("转换通话开始时间为小时...")
+data['start_hour'] = pd.to_datetime(data['start_time'].astype(str), format='%H:%M:%S', errors='coerce').dt.hour
 
-# 提取其他行为特征，如每个用户的平均通话时长
-data['avg_call_duration'] = data.groupby('calling_nbr')['raw_dur'].transform('mean')
+# 检查是否有无法转换的时间
+if data['start_hour'].isnull().any():
+    logger.warning("存在无法转换的 start_time，相关行将被移除。")
+    data = data.dropna(subset=['start_hour'])
 
-# 每个用户的通话次数
-data['total_calls'] = data.groupby('calling_nbr')['raw_dur'].transform('count')
+# 2.2 将24小时分为8个时间段，每3小时一段 (0-3,3-6,...,21-24)
+logger.info("划分时间段...")
+data['time_slot'] = data['start_hour'] // 3 + 1
 
-# 3. 数据标准化（对于K-means和决策树来说，标准化是必要的）
-features = ['call_duration', 'avg_call_duration', 'total_calls', 'is_caller', 'time_slot']
+# 2.3 通话时长转换为数值类型
+logger.info("提取并转换通话时长为数值类型...")
+data['call_duration'] = pd.to_numeric(data['raw_dur'], errors='coerce')
+
+# 检查并处理无法转换的通话时长
+if data['call_duration'].isnull().any():
+    logger.warning("存在无法转换的 call_duration，相关行将被移除。")
+    data = data.dropna(subset=['call_duration'])
+
+# 2.4 用户级别聚合特征（平均通话时长和总通话次数）
+logger.info("聚合用户级别特征（平均通话时长和总通话次数）...")
+user_features = data.groupby('calling_nbr').agg(
+    avg_call_duration=('call_duration', 'mean'),
+    total_calls=('call_duration', 'count')
+).reset_index()
+
+# 2.5 计算各时间段通话比例
+logger.info("计算各时间段通话比例...")
+time_slot_counts = data.groupby(['calling_nbr', 'time_slot']).size().unstack(fill_value=0)
+
+# 重命名时间段列名为字符串，避免混合类型
+logger.info("重命名时间段列名为字符串...")
+time_slot_counts.columns = [f"time_slot_{int(col)}" for col in time_slot_counts.columns]
+
+# 计算时间段比例
+logger.info("计算时间段通话比例...")
+time_slot_props = time_slot_counts.div(time_slot_counts.sum(axis=1), axis=0).reset_index()
+
+# 2.6 合并用户级别特征（平均通话时长、总通话数、时间段分布）
+logger.info("合并用户级别特征...")
+user_data = pd.merge(user_features, time_slot_props, on='calling_nbr', how='left')
+
+# 2.7 如果存在 call_type 字段，生成用户标签（用户最常见的 call_type）
+if 'call_type' in data.columns:
+    logger.info("生成用户级别的 call_type 标签...")
+    user_call_type = data.groupby('calling_nbr')['call_type'].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown').reset_index()
+    user_data = pd.merge(user_data, user_call_type, on='calling_nbr', how='left')
+    user_data.rename(columns={'call_type': 'user_call_type'}, inplace=True)
+else:
+    logger.info("数据集中不存在 call_type 字段，跳过生成用户标签的步骤。")
+
+# 3. 准备聚类特征，不包含用户标识和用户标签列
+logger.info("准备聚类特征...")
+if 'user_call_type' in user_data.columns:
+    cluster_features = [col for col in user_data.columns if col not in ['calling_nbr', 'user_call_type']]
+else:
+    cluster_features = [col for col in user_data.columns if col != 'calling_nbr']
+
+X = user_data[cluster_features]
+
+# 4. 数据标准化
+logger.info("开始数据标准化...")
 scaler = StandardScaler()
-data[features] = scaler.fit_transform(data[features])
+X_scaled = scaler.fit_transform(X)
 
-# 选择聚类或分类模型所需的特征
-X = data[['call_duration', 'avg_call_duration', 'total_calls', 'is_caller', 'time_slot']]
+# 5. K-means 聚类分析
+logger.info("开始 K-means 聚类分析...")
+kmeans = KMeans(n_clusters=3, random_state=42)  # 根据需要调整簇数
+user_data['cluster'] = kmeans.fit_predict(X_scaled)
 
-# 4. K-means 聚类分析
-kmeans = KMeans(n_clusters=3, random_state=42)  # 假设分为3个簇
-data['cluster'] = kmeans.fit_predict(X)
+# 6. 聚类结果可视化
 
-# 5. 聚类结果可视化：展示不同簇的用户群体
+# 6.1 可视化聚类结果：平均通话时长 vs. 总通话数
+logger.info("可视化聚类结果：平均通话时长 vs. 总通话数...")
 plt.figure(figsize=(10, 6))
-sns.scatterplot(data=data, x='call_duration', y='avg_call_duration', hue='cluster', palette='viridis')
-plt.title('K-means Clustering Results')
-plt.xlabel('Call Duration')
-plt.ylabel('Average Call Duration')
+sns.scatterplot(data=user_data, x='avg_call_duration', y='total_calls', hue='cluster', palette='viridis')
+plt.title('User-level K-means Clustering Results')
+plt.xlabel('Average Call Duration')
+plt.ylabel('Total Calls')
 plt.legend(title='Cluster')
 plt.show()
 
-# 查看每个簇的用户特征
-# print(data.groupby('cluster').mean())
+# 6.2 查看每个簇的用户特征平均值
+logger.info("查看每个簇的用户特征平均值...")
+cluster_means = user_data.groupby('cluster').mean().reset_index()
+# print(cluster_means)
 
-from sklearn.tree import DecisionTreeClassifier, plot_tree
-import matplotlib.pyplot as plt
-
-# 6. 分类分析：决策树
-X_class = data[['call_duration', 'avg_call_duration', 'total_calls', 'is_caller', 'time_slot']]
-y_class = data['call_type']  # 假设我们要预测通话类型
-
-# 使用决策树进行分类
-dtree = DecisionTreeClassifier(random_state=42)
-dtree.fit(X_class, y_class)
-
-# 7. 可视化决策树
-# 确保 class_names 是一个列表，并且每个类别为字符串
-class_names = [str(cls) for cls in y_class.unique()]  # 将类别转换为字符串并创建列表
-
-# 可视化决策树
-plt.figure(figsize=(12, 8))
-plot_tree(dtree, filled=True, feature_names=X_class.columns, class_names=class_names, fontsize=10)
-plt.show()
-
-# 8. 分类结果预测
-y_pred = dtree.predict(X_class)
-
-
-# 评估分类效果：准确性
-from sklearn.metrics import accuracy_score
-print("Accuracy:", accuracy_score(y_class, y_pred))
-
-# 可视化聚类结果（通话时长 vs. 平均通话时长）
-plt.figure(figsize=(10, 6))
-sns.scatterplot(data=data, x='call_duration', y='avg_call_duration', hue='cluster', palette='viridis')
-plt.title('K-means Clustering Results')
-plt.xlabel('Call Duration')
-plt.ylabel('Average Call Duration')
-plt.legend(title='Cluster')
-plt.show()
-
-# 决策树分类可视化（已经在上面用 plot_tree 展示过）
-
-from sklearn.metrics import silhouette_score
-silhouette_avg = silhouette_score(X, kmeans.labels_)
+# 6.3 使用轮廓系数评估聚类结果
+logger.info("计算 Silhouette Score 以评估聚类效果...")
+silhouette_avg = silhouette_score(X_scaled, user_data['cluster'])
 print(f'Silhouette Score: {silhouette_avg}')
 
-from sklearn.model_selection import cross_val_score
-scores = cross_val_score(dtree, X_class, y_class, cv=5)
-print(f'Cross-validation scores: {scores}')
+# 6.4 可视化每个簇的特征分布（例如：箱线图）
+logger.info("可视化每个簇的特征分布（箱线图）...")
+numeric_features = ['avg_call_duration', 'total_calls'] + [col for col in user_data.columns if col.startswith('time_slot_')]
+for feature in numeric_features:
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x='cluster', y=feature, data=user_data, palette='viridis')
+    plt.title(f'Cluster vs {feature}')
+    plt.xlabel('Cluster')
+    plt.ylabel(feature)
+    plt.show()
+
+# 7. 若需要分类分析（假设要预测 user_call_type）
+if 'user_call_type' in user_data.columns:
+    logger.info("开始分类分析（决策树）...")
+    # 准备分类数据, X_class 不包含用户ID和 cluster 以及标签本身
+    X_class = user_data[cluster_features]
+    y_class = user_data['user_call_type']
+
+    # 使用决策树进行分类
+    logger.info("训练决策树分类模型...")
+    dtree = DecisionTreeClassifier(random_state=42)
+    dtree.fit(X_scaled, y_class)
+
+    # 可视化决策树
+    logger.info("可视化决策树...")
+    plt.figure(figsize=(20, 10))
+    class_names = [str(cls) for cls in y_class.unique()]
+    plot_tree(dtree, filled=True, feature_names=cluster_features, class_names=class_names, fontsize=10)
+    plt.show()
+
+    # 预测与评估
+    logger.info("预测并评估分类模型...")
+    y_pred = dtree.predict(X_scaled)
+    print("Decision Tree Accuracy:", accuracy_score(y_class, y_pred))
+
+    # 交叉验证
+    logger.info("进行交叉验证评估分类模型...")
+    scores = cross_val_score(dtree, X_scaled, y_class, cv=5)
+    print(f'Cross-validation scores: {scores}')
+else:
+    logger.info("无需进行分类分析，跳过相关步骤。")
+
+# 8. 清理内存
+logger.info("清理内存...")
+del data, user_features, time_slot_counts, time_slot_props
+if 'user_call_type' in locals():
+    del user_call_type
+gc.collect()
+
+logger.info("代码执行完毕。")
