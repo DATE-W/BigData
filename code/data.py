@@ -32,8 +32,6 @@ valid_call_types = [1, 2, 3]
 data = data[data['call_type'].isin(valid_call_types)]
 
 # 5. 确保 calling_nbr 和 called_nbr 保持为字符串类型（包括数字前导零）
-# 不需要再做转换，因为我们已经在读取时强制它们为字符串
-
 # 6. 清洗完毕后，查看清洗后的数据
 print(data.head())
 
